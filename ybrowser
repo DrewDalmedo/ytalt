@@ -1,0 +1,277 @@
+#!/bin/sh
+# ------------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------------
+cache_dir="${XDG_CACHE_HOME}/ychannels"
+videos_dir="${HOME}/Videos/ytvideos"
+categories_file="${XDG_DATA_HOME}/ytvideos/categories"
+channels_file="${XDG_DATA_HOME}/ytvideos/channels"
+lists_dir="${XDG_DATA_HOME}/ytvideos/clists"
+
+mkdir -p "${cache_dir}" "${videos_dir}" "${lists_dir}"
+
+# ------------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------------
+print_lines() { printf '%s\n' "$@"; }
+
+dmenu_select() {
+    # stdin: list; $1: prompt
+    input="$(cat)"
+    lines="$(print_lines "${input}" | wc -l)"
+    [ "${lines}" -gt 21 ] && lines=21
+    [ -z "${input}" ] && lines=0
+
+    # NOTE: replaced dmenu with dmenu-wl for sway compat.
+    # kept original line commented here for reference
+
+    #print_lines "${input}" | dmenu -i -l "${lines}" -p "$1"
+    print_lines "${input}" | dmenu-wl -i -l "${lines}" -p "$1"
+}
+
+rofi_select() {
+    # stdin  : list of items (one per line)
+    # $1     : prompt string
+    #
+    # Notes:
+    #   - `-dmenu`  puts rofi in dmenu-mode
+    #   - `-i`      makes matching case-insensitive
+    #   - `-p`      sets prompt label
+    #   - `-lines`  limits how many rows are shown (same role as dmenu -l)
+    #
+    input="$(cat)"
+    lines="$(printf '%s\n' "${input}" | wc -l)"
+    [ "${lines}" -gt 21 ] && lines=21
+    [ -z "${input}" ] && lines=0
+
+    printf '%s\n' "${input}" | \
+        rofi -dmenu -i -p "$1" -lines "${lines}"
+}
+
+send_notification() {
+    notify-send -i "${XDG_CONFIG_HOME}/dunst/yt.png" "$1"
+}
+
+# ------------------------------------------------------------------
+# TSV helpers
+# ------------------------------------------------------------------
+sorted_video_titles() {
+    tsv_file="$1"
+    sort_option="$2"
+    case "${sort_option}" in
+        "@@sv") sort -nr -t '	' -k3 "${tsv_file}" ;;   # views
+        "@@sd") sort -nr -t '	' -k4 "${tsv_file}" ;;   # duration
+        *)      sort -nr -t '	' -k5 "${tsv_file}" ;;   # date
+    esac | cut -f1
+}
+
+get_channel_titles() {
+    channel_name="$1"
+    sort_option="$2"
+    tsv_file="${cache_dir}/${channel_name}.tsv"
+    sorted_video_titles "${tsv_file}" "${sort_option}"
+}
+
+get_video_url() {
+    channel_name="$1"
+    video_title="$2"
+    tsv_file="${cache_dir}/${channel_name}.tsv"
+    grep -F "${video_title}" "${tsv_file}" | cut -f2
+}
+
+# ------------------------------------------------------------------
+# Menus & actions
+# ------------------------------------------------------------------
+main_actions_menu() {
+    print_lines WATCH DOWNLOAD "SEND TO A LIST" | rofi_select "Actions"
+}
+
+choose_list() {
+    lists="$(print_lines "${lists_dir}"/* | sed 's|.*/||')"
+    [ "${lists}" = "*" ] && lists=""
+    print_lines ${lists} "## CREATE LIST ##" "## DELETE LIST ##" | rofi_select "Lists"
+}
+
+list_video_actions() {
+    print_lines WATCH DOWNLOAD DELETE | rofi_select "Actions"
+}
+
+append_to_list() {
+    video_title="$1"
+    channel_name="$2"
+    list_name="$3"
+    print_lines "${channel_name}: ${video_title}" >> "${lists_dir}/${list_name}"
+}
+
+# ------------------------------------------------------------------
+# Custom list management
+# ------------------------------------------------------------------
+lists_manager() {
+    while :; do
+        list_choice="$(choose_list)"
+        case "${list_choice}" in
+            "## CREATE LIST ##")
+                new_list="$(print_lines | rofi_select "Name")"
+                [ -n "${new_list}" ] && touch "${lists_dir}/${new_list}"
+                ;;
+            "## DELETE LIST ##")
+                del_list="$(find "${lists_dir}" -mindepth 1 -exec basename {} \; \
+                           | rofi_select "Delete List")"
+                [ -n "${del_list}" ] && rm -f "${lists_dir}/${del_list}"
+                ;;
+            "") return ;;
+            *)  custom_list_video_menu "${list_choice}" ;;
+        esac
+    done
+}
+
+custom_list_video_menu() {
+    list_name="$1"
+    while :; do
+        video_entry=$(rofi_select "Videos" < "${lists_dir}/${list_name}")
+        [ -n "${video_entry}" ] || return
+        channel_name="${video_entry%%: *}"
+        video_title="${video_entry##*: }"
+        custom_list_video_action "${video_title}" "${channel_name}" "${list_name}"
+    done
+}
+
+custom_list_video_action() {
+    video_title="$1"
+    channel_name="$2"
+    list_name="$3"
+    action="$(list_video_actions)"
+    case "${action}" in
+        WATCH)    video_play_or_download "${action}" "${video_title}" "${channel_name}" ;;
+        DOWNLOAD) video_play_or_download "${action}" "${video_title}" "${channel_name}" \
+                    && send_notification "Download finished" ;;
+        DELETE)   sed -i "/${video_title}/d" "${lists_dir}/${list_name}" ;;
+        *)        return ;;
+    esac
+}
+
+# ------------------------------------------------------------------
+# Playing / downloading
+# ------------------------------------------------------------------
+video_play_or_download() {
+    action="$1"
+    video_title="$2"
+    channel_name="$3"
+    url="$(get_video_url "${channel_name}" "${video_title}")"
+
+    case "${action}" in
+        WATCH)    mpv "${url}" ;;
+        DOWNLOAD)
+            chan_dir="${videos_dir}/${channel_name}"
+            mkdir -p "${chan_dir}"
+            yt-dlp -o "${chan_dir}/%(title)s.%(ext)s" "${url}"
+            send_notification "Download finished"
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------
+# Aggregated view (all channels)
+# ------------------------------------------------------------------
+get_all_titles() {
+    sort_option="$1"
+    all_tsv="${cache_dir}/all_videos.tsv"
+    sorted_video_titles "${all_tsv}" "${sort_option}"
+}
+
+browse_all_channels() {
+    while video_title="$(get_all_titles | rofi_select "Videos | Sort: @@s{v,d}")"; do
+        [ -n "${video_title}" ] || break
+        if [ "${video_title}" = "@@sv" ] || [ "${video_title}" = "@@sd" ]; then
+            video_title="$(get_all_titles "${video_title}" | rofi_select "Videos")"
+            [ -n "${video_title}" ] || continue
+        fi
+        grep -lF "${video_title}" "${cache_dir}"/*.tsv | head -n 1 | while read -r video_file; do
+            video_action_menu "${video_title}" "$(basename "${video_file}" .tsv)"
+            break
+        done
+    done
+}
+
+# ------------------------------------------------------------------
+# Category & channel navigation
+# ------------------------------------------------------------------
+category_menu() {
+    while :; do
+        category="$(cut -d= -f1 "${categories_file}" | rofi_select "Categories")"
+        [ -n "${category}" ] || return
+        channel_menu "${category}"
+    done
+}
+
+channel_menu() {
+    category="$1"
+
+    # Grab the line after “category=” and turn the “|” separators into newlines
+    channel_list="$(sed -n "s/^${category}=//p" "${categories_file}" | tr '|' '\n')"
+
+    # Interactive loop
+    while :; do
+        channel_name="$(print_lines "${channel_list}" | rofi_select "Channels")"
+        [ -n "${channel_name}" ] || return
+        video_menu "${channel_name}"
+    done
+}
+
+# ------------------------------------------------------------------
+# Per-channel video browser
+# ------------------------------------------------------------------
+video_menu() {
+    channel_name="$1"
+    while :; do
+        video_title="$(get_channel_titles "${channel_name}" | rofi_select "Videos")"
+        [ -n "${video_title}" ] || return
+        if [ "${video_title}" = "@@sv" ] || [ "${video_title}" = "@@sd" ]; then
+            sort_option="${video_title}"
+            video_title="$(get_channel_titles "${channel_name}" "${sort_option}" | \
+                          rofi_select "Videos")"
+        fi
+        video_action_menu "${video_title}" "${channel_name}"
+    done
+}
+
+video_action_menu() {
+    video_title="$1"
+    channel_name="$2"
+    while [ -n "${video_title}" ] && [ "${video_title}" != "@@sv" ] \
+          && [ "${video_title}" != "@@sd" ]; do
+        action="$(main_actions_menu)"
+        case "${action}" in
+            WATCH)    video_play_or_download "${action}" "${video_title}" "${channel_name}" ;;
+            DOWNLOAD) video_play_or_download "${action}" "${video_title}" "${channel_name}" \
+                         && send_notification "Download finished" ;;
+            "SEND TO A LIST")
+                list_name="$(find "${lists_dir}" -mindepth 1 -exec basename {} \; \
+                            | rofi_select "Lists")"
+                [ -n "${list_name}" ] && append_to_list "${video_title}" "${channel_name}" \
+                                                    "${list_name}" \
+                                        && send_notification "${video_title} -> list: ${list_name}"
+                ;;
+            *) return ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------
+# Main menu & loop
+# ------------------------------------------------------------------
+main_menu() {
+    print_lines " ## ALL CHANNELS ##" " ## CATEGORIES ##" " ## CUSTOM LISTS ##" \
+        "$(cut -d= -f1 "${channels_file}")" | rofi_select "YouTube"
+}
+
+while :; do
+    main_choice="$(main_menu)"
+    case "${main_choice}" in
+        " ## ALL CHANNELS ##") browse_all_channels ;;
+        " ## CATEGORIES ##")   category_menu ;;
+        " ## CUSTOM LISTS ##") lists_manager ;;
+        "") exit ;;
+        *)  video_menu "${main_choice}" ;;
+    esac
+done

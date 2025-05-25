@@ -1,0 +1,107 @@
+#!/bin/dash
+# Wait for network before continuing
+while ! ping -c 1 9.9.9.9 >/dev/null 2>&1; do sleep 0.5; done
+
+# --------------------------------------------------------------------
+# Paths & helpers
+# --------------------------------------------------------------------
+cache_dir="${XDG_CACHE_HOME}/ychannels"
+channels_file="${XDG_DATA_HOME}/ytvideos/channels"
+categories_file="${XDG_DATA_HOME}/ytvideos/categories"
+
+send_notification() {
+    # $1 — message text
+    notify-send -i "${XDG_CONFIG_HOME}/dunst/yt.png" -u critical "$1"
+}
+
+# --------------------------------------------------------------------
+# One-time bootstrap: create default files & ensure dependencies
+# --------------------------------------------------------------------
+ensure_setup() {
+    if [ ! -s "$channels_file" ] && [ ! -s "$categories_file" ]; then
+        printf '%s\n' \
+            'Luke Smith=https://www.youtube.com/@LukeSmithxyz/videos' \
+            'Mental Outlaw=https://www.youtube.com/@MentalOutlaw/videos' \
+            > "$channels_file"
+
+        printf '%s\n' 'Tech=Luke Smith|Mental Outlaw' > "$categories_file"
+
+        # --- Only attempt to install if pacman exists (i.e. on Arch) ---
+        if command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --needed --noconfirm mpv yt-dlp jq \
+                || send_notification 'Failed to install mpv, yt-dlp or jq'
+        fi
+    fi
+}
+
+# --------------------------------------------------------------------
+# Compare channel snapshots and notify on new videos
+# --------------------------------------------------------------------
+check_new_videos() {
+    channel_name="$1"
+    data_file="${cache_dir}/${channel_name}.tsv"
+    old_data_file="${cache_dir}/${channel_name}_old.tsv"
+
+    if [ -f "$old_data_file" ]; then
+        old_urls=$(cut -f2 "$old_data_file")
+        new_urls=$(cut -f2 "$data_file")
+
+        printf '%s\n' "$old_urls" | sort > /tmp/yt_old.$$
+        printf '%s\n' "$new_urls" | sort > /tmp/yt_new.$$
+
+        new_video_count=$(comm -13 /tmp/yt_old.$$ /tmp/yt_new.$$ | wc -l)
+        rm -f /tmp/yt_old.$$ /tmp/yt_new.$$
+
+        [ "$new_video_count" -gt 0 ] && \
+            send_notification "${channel_name} | ${new_video_count} new videos"
+    fi
+}
+
+# --------------------------------------------------------------------
+# Refresh TSV for a single channel
+# --------------------------------------------------------------------
+update_channel() {
+    channel_name="$1"
+    channel_url="$2"
+    data_file="${cache_dir}/${channel_name}.tsv"
+    old_data_file="${cache_dir}/${channel_name}_old.tsv"
+
+    mv -f "$data_file" "$old_data_file" 2>/dev/null
+
+    yt-dlp -j --flat-playlist --skip-download \
+           --extractor-args 'youtubetab:approximate_date' \
+           "$channel_url" |
+        jq -r '[.title, .url, .view_count, .duration, .upload_date] | @tsv' \
+        > "$data_file"
+}
+
+# --------------------------------------------------------------------
+# Refresh all channels & rebuild aggregate TSV
+# --------------------------------------------------------------------
+update_all_channels() {
+    # Pull latest data in parallel
+    while IFS='=' read -r channel_name channel_url; do
+        update_channel "$channel_name" "$channel_url" &
+    done < "$channels_file"
+    wait
+
+    # Compare with previous snapshots
+    while IFS='=' read -r channel_name _; do
+        check_new_videos "$channel_name"
+    done < "$channels_file"
+
+    # Re-create master TSV containing every video
+    all_videos_file="${cache_dir}/all_videos.tsv"
+    : > "$all_videos_file"    # truncate
+
+    while IFS='=' read -r channel_name _; do
+        cat "${cache_dir}/${channel_name}.tsv" >> "$all_videos_file"
+    done < "$channels_file"
+}
+
+# --------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------
+mkdir -p "$cache_dir" && touch "$channels_file"
+ensure_setup
+update_all_channels
